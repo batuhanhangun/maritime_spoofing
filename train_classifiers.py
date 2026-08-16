@@ -53,9 +53,9 @@ matplotlib.rcParams.update({
 # ============================================================
 # Paths
 # ============================================================
-INPUT_CSV = r"D:\IDMAN_Downloads\ZIP\8202936\dataset\dataset\marsim_features.csv"
-MANA_CSV = r"D:\IDMAN_Downloads\ZIP\8202936\results\mana\mana_predictions.csv"
-RESULTS_DIR = r"D:\IDMAN_Downloads\ZIP\8202936\results\ml_classifiers"
+INPUT_CSV = os.path.join("data", "marsim_features.csv")
+MANA_CSV = os.path.join("data", "mana_predictions.csv")
+RESULTS_DIR = os.path.join("results", "ml_classifiers")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 METADATA_COLS = ['filename', 'scenario', 'label', 'index',
