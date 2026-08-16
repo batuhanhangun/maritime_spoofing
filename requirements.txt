@@ -7,3 +7,5 @@ lightgbm
 matplotlib
 seaborn
 statsmodels
+pyserial
+ephem

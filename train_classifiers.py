@@ -54,8 +54,8 @@ matplotlib.rcParams.update({
 # Paths
 # ============================================================
 INPUT_CSV = r"D:\IDMAN_Downloads\ZIP\8202936\dataset\dataset\marsim_features.csv"
-MANA_CSV = r"D:\IDMAN_Downloads\ZIP\8202936\dataset\dataset\mana_predictions.csv"
-RESULTS_DIR = r"D:\IDMAN_Downloads\ZIP\8202936\results"
+MANA_CSV = r"D:\IDMAN_Downloads\ZIP\8202936\results\mana\mana_predictions.csv"
+RESULTS_DIR = r"D:\IDMAN_Downloads\ZIP\8202936\results\ml_classifiers"
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 METADATA_COLS = ['filename', 'scenario', 'label', 'index',
@@ -299,7 +299,7 @@ for name, clf in classifiers.items():
     probabilities[name] = clf.predict_proba(X_eval)[:, 1]
 
 predictions['MANA'] = mana_test_pred
-inference_times['MANA'] = np.nan  # Computed separately from run_mana_baseline.py
+inference_times['MANA'] = 249.0  # ms/file measured from run_mana_baseline.py (10787s / 43320 files)
 
 all_clf_names = list(classifiers.keys()) + ['MANA']
 

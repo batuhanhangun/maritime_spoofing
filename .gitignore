@@ -36,3 +36,11 @@ Step1_Antigravity_Prompt_MARSIM_Feature_Extraction.md
 Step2_sanity_check.py
 Step3_Antigravity_Prompt_ML_Training.md
 parameter_space.png
+
+# Paper / figures (not needed to run the code)
+*.pdf
+Figures/
+main.tex
+figure_prompts_for_claude_code.md
+Gemini_Generated_Image_*.png
+.claude/

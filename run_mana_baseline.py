@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-"""
-run_mana_baseline.py — Run MANA framework on all 43,320 MARSIM pcap files.
+r"""
+run_mana_baseline.py  --  Run MANA framework on all 43,320 MARSIM pcap files.
 
 Produces a CSV with per-file predictions and per-method trigger flags.
 Must be run BEFORE train_classifiers.py.
@@ -10,7 +10,7 @@ Usage:
     python run_mana_baseline.py
 
 Output:
-    D:\IDMAN_Downloads\ZIP\8202936\dataset\dataset\mana_predictions.csv
+    D:\IDMAN_Downloads\ZIP\8202936\results\mana\mana_predictions.csv
 
 Notes:
     - MANA must be installed in the environment (python setup.py install).
@@ -18,12 +18,13 @@ Notes:
     - Two methods excluded (OrbitPositionsMethod, PhysicalEnvironmentLimitMethod)
       because required data files (gps.tle, water_map.png) were not bundled
       during setup.py install.
-    - Expected runtime: ~30-90 minutes for 43K files depending on hardware.
+    - Uses multiprocessing for parallel file processing.
 """
 
 import json
 import os
 import time
+import multiprocessing
 import pandas as pd
 
 from mana.feeder import PcapFeeder
@@ -35,56 +36,33 @@ from mana.method import load_methods_json
 # ============================================================
 METHODS_JSON_PATH = r"D:\IDMAN_Downloads\ZIP\8202936\methods.json"
 BASE_PATH = r"D:\IDMAN_Downloads\ZIP\8202936\dataset\dataset"
-OUTPUT_PATH = r"D:\IDMAN_Downloads\ZIP\8202936\dataset\dataset\mana_predictions.csv"
+MANA_RESULTS_DIR = r"D:\IDMAN_Downloads\ZIP\8202936\results\mana"
+os.makedirs(MANA_RESULTS_DIR, exist_ok=True)
+OUTPUT_PATH = os.path.join(MANA_RESULTS_DIR, "mana_predictions.csv")
 
 # ============================================================
-# Load MANA configuration
+# Worker function (runs in separate process)
 # ============================================================
-# load_methods_json returns (device_ids, method_classes, method_options)
-device_ids, method_classes, method_options = load_methods_json(METHODS_JSON_PATH)
+def process_single_file(args):
+    """Process one pcap file through MANA and return its result dict."""
+    filename, base_path, methods_json_path = args
+    filepath = os.path.join(base_path, filename)
 
-# Load dataset manifest
-with open(os.path.join(BASE_PATH, "dataset.json")) as f:
-    dataset = json.load(f)
+    # Each worker must load its own MANA config (not shared across processes)
+    device_ids, method_classes, method_options = load_methods_json(methods_json_path)
 
-print("=" * 60)
-print("MANA Baseline Runner")
-print("=" * 60)
-print(f"Total files to process: {len(dataset)}")
-print(f"Active MANA methods ({len(method_classes)}):")
-for mc in method_classes:
-    print(f"  - {mc.__name__}")
-print()
-print("NOTE: OrbitPositionsMethod (EDV) and PhysicalEnvironmentLimitMethod")
-print("      (PCC_env) are EXCLUDED — required data files (gps.tle,")
-print("      water_map.png) were not copied during setup.py install.")
-print("=" * 60)
-
-# ============================================================
-# Run MANA on every pcap file
-# ============================================================
-results = []
-start_time = time.time()
-
-for i, entry in enumerate(dataset):
-    filename = entry["filename"]
-    filepath = os.path.join(BASE_PATH, filename)
-
-    # ---- Per-file trigger list (MUST be inside loop to reset) ----
     triggered_methods = []
 
     def on_spoofing_attack(device_id, spoofing_indicator, method, state):
-        """Callback fired when MANA detects a spoofing indicator above threshold."""
         method_name = type(method).__name__
         if method_name not in triggered_methods:
             triggered_methods.append(method_name)
 
-    # ---- Create a NEW handler per file (handler accumulates NMEA state) ----
     handler = DetectionHandler(
         device_ids=device_ids,
         method_classes=method_classes,
         method_options=method_options,
-        detection_threshold=0.1,  # matches the original MANA paper
+        detection_threshold=0.1,
         on_spoofing_attack=on_spoofing_attack,
     )
 
@@ -93,14 +71,11 @@ for i, entry in enumerate(dataset):
     try:
         feeder.run()
     except Exception as e:
-        print(f"  ERROR on {filename}: {e}")
-        results.append({"filename": filename, "mana_pred": -1, "error": str(e)})
-        continue
+        return {"filename": filename, "mana_pred": -1, "error": str(e)}
 
-    # Any method triggered → predict spoofed
     mana_pred = 1 if len(triggered_methods) > 0 else 0
 
-    result = {
+    return {
         "filename": filename,
         "mana_pred": mana_pred,
         "mana_triggered_methods": ",".join(triggered_methods) if triggered_methods else "",
@@ -111,42 +86,83 @@ for i, entry in enumerate(dataset):
         "cdm": 1 if "TimeDriftMethod" in triggered_methods else 0,
         "cnm": 1 if "CarrierToNoiseDensityMethod" in triggered_methods else 0,
     }
-    results.append(result)
 
-    # Progress reporting every 1000 files
-    if (i + 1) % 1000 == 0:
-        elapsed = time.time() - start_time
-        rate = (i + 1) / elapsed
-        remaining = (len(dataset) - (i + 1)) / rate
-        print(
-            f"  [{i+1:>5}/{len(dataset)}]  "
-            f"{rate:.1f} files/s, ~{remaining/60:.0f} min remaining"
-        )
 
 # ============================================================
-# Save results
+# Main
 # ============================================================
-mana_df = pd.DataFrame(results)
-mana_df.to_csv(OUTPUT_PATH, index=False)
+if __name__ == "__main__":
 
-elapsed = time.time() - start_time
-print()
-print("=" * 60)
-print(f"Done in {elapsed/60:.1f} minutes ({elapsed:.0f} seconds)")
-print(f"Saved to {OUTPUT_PATH}")
-print(f"Shape: {mana_df.shape}")
-print(
-    f"Predictions: spoofed={int((mana_df['mana_pred']==1).sum())}, "
-    f"unspoofed={int((mana_df['mana_pred']==0).sum())}, "
-    f"errors={int((mana_df['mana_pred']==-1).sum())}"
-)
-print()
+    # Load dataset manifest
+    with open(os.path.join(BASE_PATH, "dataset.json")) as f:
+        dataset = json.load(f)
 
-# Per-method trigger summary
-print("Per-method trigger counts:")
-for col in ["pdm", "pcc_sog", "pcc_rot", "pcc_height", "cdm", "cnm"]:
-    if col in mana_df.columns:
-        count = int((mana_df[col] == 1).sum())
-        print(f"  {col:>12s}: triggered on {count} files")
+    # Load method names for display only
+    device_ids, method_classes, method_options = load_methods_json(METHODS_JSON_PATH)
 
-print("=" * 60)
+    n_workers = max(1, os.cpu_count() - 2)  # leave 2 cores free
+
+    print("=" * 60)
+    print("MANA Baseline Runner (Multiprocessing)")
+    print("=" * 60)
+    print(f"Total files to process: {len(dataset)}")
+    print(f"Workers: {n_workers} (of {os.cpu_count()} CPU cores)")
+    print(f"Active MANA methods ({len(method_classes)}):")
+    for mc in method_classes:
+        print(f"  - {mc.__name__}")
+    print()
+    print("NOTE: OrbitPositionsMethod (EDV) and PhysicalEnvironmentLimitMethod")
+    print("      (PCC_env) are EXCLUDED — required data files (gps.tle,")
+    print("      water_map.png) were not copied during setup.py install.")
+    print("=" * 60)
+
+    # Prepare worker arguments
+    work_items = [
+        (entry["filename"], BASE_PATH, METHODS_JSON_PATH)
+        for entry in dataset
+    ]
+
+    # Process in parallel
+    results = []
+    start_time = time.time()
+
+    with multiprocessing.Pool(processes=n_workers) as pool:
+        for i, result in enumerate(pool.imap_unordered(process_single_file, work_items, chunksize=20)):
+            results.append(result)
+
+            if (i + 1) % 1000 == 0:
+                elapsed = time.time() - start_time
+                rate = (i + 1) / elapsed
+                remaining = (len(dataset) - (i + 1)) / rate
+                print(
+                    f"  [{i+1:>5}/{len(dataset)}]  "
+                    f"{rate:.1f} files/s, ~{remaining/60:.0f} min remaining"
+                )
+
+    # ============================================================
+    # Save results
+    # ============================================================
+    mana_df = pd.DataFrame(results)
+    mana_df.to_csv(OUTPUT_PATH, index=False)
+
+    elapsed = time.time() - start_time
+    print()
+    print("=" * 60)
+    print(f"Done in {elapsed/60:.1f} minutes ({elapsed:.0f} seconds)")
+    print(f"Saved to {OUTPUT_PATH}")
+    print(f"Shape: {mana_df.shape}")
+    print(
+        f"Predictions: spoofed={int((mana_df['mana_pred']==1).sum())}, "
+        f"unspoofed={int((mana_df['mana_pred']==0).sum())}, "
+        f"errors={int((mana_df['mana_pred']==-1).sum())}"
+    )
+    print()
+
+    # Per-method trigger summary
+    print("Per-method trigger counts:")
+    for col in ["pdm", "pcc_sog", "pcc_rot", "pcc_height", "cdm", "cnm"]:
+        if col in mana_df.columns:
+            count = int((mana_df[col] == 1).sum())
+            print(f"  {col:>12s}: triggered on {count} files")
+
+    print("=" * 60)
