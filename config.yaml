@@ -1,0 +1,58 @@
+# maritime_spoofing configuration.
+# Override any value on the command line, e.g.:
+#   python scripts/extract_features.py --config config.yaml --dataset-dir /data/marsim
+
+paths:
+  # MARSIM dataset root (contains dataset.json and the pcap files)
+  dataset_dir: "dataset/dataset"
+  # Per-epoch parquet series (new artifact enabling sequence models and
+  # sliding-window evaluation). One file per recording, sharded by scenario.
+  epochs_dir: "results/epochs"
+  features_csv: "data/marsim_features.csv"
+  mana_predictions_csv: "data/mana_predictions.csv"
+  results_dir: "results/ml_classifiers_v2"
+  # Real vessel logs for the false-positive validation experiment
+  real_data_dir: "data/real_nmea"
+
+receivers:
+  # MARSIM pcap receiver identification: [ip, udp_sport] -> receiver id
+  rx1: ["192.168.0.10", 62996]
+  rx2: ["192.168.0.11", 62997]
+
+extraction:
+  save_epoch_series: true      # write per-recording parquet (needed for LSTM/Transformer work)
+  validate_checksums: false    # MARSIM is clean; real logs validate regardless
+  n_workers: 0                 # 0 = os.cpu_count() - 2
+
+features:
+  profile: "full"              # "full" (138 features) or "deployable" (GGA+VTG+ZDA only)
+
+preprocessing:
+  zero_variance_eps: 1.0e-10
+  nan_col_drop_threshold: 0.5
+  skew_threshold: 5.0
+  winsorize: true              # set false to match the CIMSS paper text exactly
+  winsorize_quantiles: [0.01, 0.99]
+  correlation_threshold: 0.95
+
+split:
+  regime: "repetition"         # repetition | kfold | param_holdout
+  kfold_n: 5
+  param_holdout_preset: "a3_speed_low"   # see mspoof.splits.PARAM_HOLDOUT_PRESETS
+
+models:
+  tier: "default"              # default | adjusted | both
+  # "default": library defaults + n_estimators=500 where applicable, matching
+  #            the paper's out-of-the-box claim.
+  # "adjusted": the original repo's hand-tuned settings, reported as a
+  #             second tier and disclosed as such.
+  svm:
+    enabled: true
+    train_on_full_set: true    # false reproduces the old 10k subsample (must be disclosed)
+    subsample_size: 10000
+  seed: 42
+
+real_data:
+  window_s: 120
+  stride_s: 60
+  min_epochs: 60
