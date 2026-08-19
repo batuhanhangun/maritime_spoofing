@@ -44,3 +44,6 @@ main.tex
 figure_prompts_for_claude_code.md
 Gemini_Generated_Image_*.png
 .claude/
+data/_cache.parquet
+results/
+*.log

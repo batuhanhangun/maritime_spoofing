@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mspoof"
+version = "2.1.0"
+description = "NMEA-level GPS spoofing detection on MARSIM and real vessel logs (journal version)"
+requires-python = ">=3.10"
+dependencies = [
+  "scapy>=2.5", "pandas>=2.0", "numpy>=1.24", "pyarrow>=14.0",
+  "pyyaml>=6.0", "scikit-learn>=1.3", "xgboost>=2.0", "lightgbm>=4.0",
+  "scipy>=1.11", "statsmodels>=0.14", "matplotlib>=3.8",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

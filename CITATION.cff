@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+title: "maritime_spoofing: NMEA-level GPS spoofing detection on MARSIM and real vessel logs"
+message: "If you use this software, please cite it."
+type: software
+authors:
+  - family-names: Hangun
+    given-names: Batuhan
+    orcid: "https://orcid.org/0000-0002-0271-6868"
+  - family-names: Yavuz
+    given-names: Ilay
+    orcid: "https://orcid.org/0009-0001-3907-3747"
+version: 2.1.0
+date-released: 2026-08-19
+repository-code: "https://github.com/batuhanhangun/maritime_spoofing"
+license: MIT
