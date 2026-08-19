@@ -155,9 +155,28 @@ def compute_inter_receiver(rx1_epochs, rx2_epochs, tol=EPOCH_MATCH_TOL):
             continue
         e2 = rx2_epochs[j]
 
+        # Motion compensation: real devices sample asynchronously (e.g.
+        # C-Nav on integer seconds, Seapath at ~x.55 s), so the matched
+        # epochs differ by up to `tol` seconds. At 12 kn a 0.5 s offset is
+        # ~3 m of along-track displacement, the same order as the capture
+        # signal itself. Dead-reckon rx2 to rx1's epoch using rx2's own
+        # velocity before differencing. Exact no-op when dt == 0 (MARSIM)
+        # or when rx2 lacks a usable velocity.
+        lat2 = e2.get('lat_deg', float('nan'))
+        lon2 = e2.get('lon_deg', float('nan'))
+        dt = t1 - e2['utc_time']
+        sog2 = e2.get('sog_knots', float('nan'))
+        cog2 = e2.get('cog_deg', float('nan'))
+        if dt != 0.0 and not (math.isnan(sog2) or math.isnan(cog2)
+                              or math.isnan(lat2) or math.isnan(lon2)):
+            d_m = sog2 * 0.514444 * dt
+            lat2 = lat2 + d_m * math.cos(math.radians(cog2)) / 111320.0
+            lon2 = lon2 + d_m * math.sin(math.radians(cog2)) / (
+                111320.0 * max(math.cos(math.radians(lat2)), 1e-6))
+
         inter['inter_rx_distance_m'].append(
             haversine_m(e1.get('lat_deg', float('nan')), e1.get('lon_deg', float('nan')),
-                        e2.get('lat_deg', float('nan')), e2.get('lon_deg', float('nan'))))
+                        lat2, lon2))
 
         s1, s2 = e1.get('sog_knots', float('nan')), e2.get('sog_knots', float('nan'))
         inter['inter_rx_sog_diff'].append(
