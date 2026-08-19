@@ -204,9 +204,13 @@ def test_splits():
 
 
 if __name__ == '__main__':
-    test_geo()
-    test_nmea()
-    test_pcap_pipeline()
-    test_scs_pipeline()
-    test_splits()
-    print('\nALL TESTS PASSED')
+    import shutil
+    try:
+        test_geo()
+        test_nmea()
+        test_pcap_pipeline()
+        test_scs_pipeline()
+        test_splits()
+        print('\nALL TESTS PASSED')
+    finally:
+        shutil.rmtree(TMP, ignore_errors=True)
