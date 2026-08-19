@@ -102,6 +102,7 @@ def read_scs_files(filepaths, validate_checksums=True):
     sentences = defaultdict(dict)
     gsv = defaultdict(list)
     current_epoch = None
+    last_ext_clock = None  # carries the day anchor across bare NMEA lines
 
     for path in filepaths:
         with open(path, 'r', errors='ignore') as fh:
@@ -109,6 +110,15 @@ def read_scs_files(filepaths, validate_checksums=True):
                 ext_clock, payload = split_log_line(line)
                 if payload is None:
                     continue
+                # Mixed-archive time-base fix: a bare NMEA line (no clock
+                # prefix) yields ext_clock = NaN, and _absolute_utc would
+                # fall back to seconds-since-midnight, silently mixing two
+                # time bases in one epoch dict. Anchor bare lines to the
+                # most recent external clock instead.
+                if ext_clock is not None and not math.isnan(ext_clock):
+                    last_ext_clock = ext_clock
+                elif last_ext_clock is not None:
+                    ext_clock = last_ext_clock
                 fmt = nmea.formatter_of(payload)
                 if fmt is None:
                     continue

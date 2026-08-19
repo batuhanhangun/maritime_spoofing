@@ -1,25 +1,28 @@
 #!/usr/bin/env python
 """Train and evaluate classifiers on the MARSIM feature table.
 
-Changes vs the original train_classifiers.py:
-* split regimes: repetition (paper), kfold (variance), param_holdout
-  (generalization to unseen attack parameters; Review 1's key concern)
-* model tiers: "default" (true library defaults, n_estimators=500) and
-  "adjusted" (the original repo's hand-tuned settings), so the paper's
-  out-of-the-box claim and the stronger config are both reported honestly
-* SVM trains on the FULL training set by default (the old 10k subsample and
-  C=10 contradicted the paper text; subsampling remains available via config
-  and is recorded in the output when used)
-* MANA rows with errors/missing predictions are EXCLUDED from the comparison
-  (symmetrically for all classifiers) instead of silently coerced to 0,
-  and the exclusion count is reported
-* base-rate analysis: precision as a function of assumed spoofing prevalence,
-  recomputed from confusion counts (Review 1, deployment realism)
-* every run writes a run_manifest.json capturing config, split, tier, seed,
-  and library versions for artifact-grade reproducibility
+Journal-version changes on top of the CIMSS-era script (each maps to a flaw
+found during the internal audit; see README "Journal-version findings"):
 
-Figures intentionally live in a separate plotting script; this one produces
-CSV outputs only, so HPC runs need no display stack.
+* correlation filter now implements the algorithm the paper TEXT describes
+  (iterative removal by highest mean absolute correlation) via
+  mspoof.preprocess.iterative_corr_filter; the old greedy upper-triangle
+  rule silently selected a different feature set
+* artifact ablation: preprocessing.ablate_families (default ['snr','gsa'])
+  drops the simulator-fingerprint SNR family and dead GSA features BEFORE
+  any fitting (see scripts/audit_dataset.py for the evidence)
+* MANA comparison is denominator-symmetric: when MANA rows are excluded,
+  ML metrics are ALSO reported on the identical valid subset
+  (overall_results_mana_subset.csv), not just on the full test set
+* base-rate analysis carries Clopper-Pearson intervals; a zero-FP count no
+  longer yields a meaningless precision == 1.0 at low prevalence
+* SVM: probability=False by default (avoids the hidden 5-fold Platt refit
+  that made full-set training take hours); AUC uses decision_function
+* threshold-policy evaluation (thresholds.enabled): negatives-anchored
+  fpr_target thresholds computed on an in-distribution validation carve-out,
+  written to threshold_results.csv; motivated by the extrapolation-regime
+  recall collapse at threshold 0.5 (see mspoof.thresholds docstring)
+* run_manifest.json now actually records library versions
 
 Usage:
     python scripts/train_classifiers.py --config config.yaml
@@ -47,11 +50,19 @@ from sklearn.model_selection import train_test_split as sk_split
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from mspoof.config import load_config  # noqa: E402
-from mspoof import splits as split_mod  # noqa: E402
+from mspoof.config import load_config              # noqa: E402
+from mspoof import splits as split_mod             # noqa: E402
+from mspoof.ablation import drop_families          # noqa: E402
+from mspoof.preprocess import iterative_corr_filter  # noqa: E402
+from mspoof.thresholds import pick_threshold, scores_of  # noqa: E402
+from mspoof.stats import precision_at_prevalence_interval  # noqa: E402
 
 META_COLS = ['filename', 'scenario', 'label', 'index',
              'param_1_name', 'param_1_value', 'param_2_name', 'param_2_value']
+
+
+def _cfg_get(section, key, default):
+    return getattr(section, key, default) if section is not None else default
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +74,7 @@ def build_models(tier, seed, svm_cfg):
     from xgboost import XGBClassifier
     from lightgbm import LGBMClassifier
 
+    svm_prob = bool(_cfg_get(svm_cfg, 'probability', False))
     zoo = {}
     if tier in ('default', 'both'):
         zoo['RF-default'] = (RandomForestClassifier(
@@ -74,7 +86,7 @@ def build_models(tier, seed, svm_cfg):
             n_estimators=500, random_state=seed, n_jobs=-1, verbose=-1), False)
         if svm_cfg.enabled:
             zoo['SVM-default'] = (SVC(
-                kernel='rbf', C=1.0, gamma='scale', probability=True,
+                kernel='rbf', C=1.0, gamma='scale', probability=svm_prob,
                 random_state=seed), True)
     if tier in ('adjusted', 'both'):
         zoo['RF-adjusted'] = (RandomForestClassifier(
@@ -92,7 +104,7 @@ def build_models(tier, seed, svm_cfg):
         if svm_cfg.enabled:
             zoo['SVM-adjusted'] = (SVC(
                 kernel='rbf', C=10.0, gamma='scale', class_weight='balanced',
-                probability=True, random_state=seed), True)
+                probability=svm_prob, random_state=seed), True)
     return zoo
 
 
@@ -101,6 +113,14 @@ def build_models(tier, seed, svm_cfg):
 # ---------------------------------------------------------------------------
 
 def preprocess(X_train, X_test, pp_cfg, log):
+    ablate = list(_cfg_get(pp_cfg, 'ablate_families', []) or [])
+    if ablate:
+        keep = drop_families(list(X_train.columns), ablate)
+        dropped = [c for c in X_train.columns if c not in keep]
+        X_train, X_test = X_train[keep], X_test[keep]
+        log.append({'step': 'artifact_ablation', 'n_dropped': len(dropped),
+                    'columns': ','.join(dropped)})
+
     std = X_train.std()
     zero_var = std[std < pp_cfg.zero_variance_eps].index.tolist()
     X_train = X_train.drop(columns=zero_var)
@@ -133,12 +153,11 @@ def preprocess(X_train, X_test, pp_cfg, log):
         X_test = X_test.clip(lower=lo, upper=hi, axis=1)
         log.append({'step': 'winsorize', 'n_dropped': 0, 'columns': f'{lo_q},{hi_q}'})
 
-    corr = X_train.corr().abs()
-    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
-    corr_cols = [c for c in upper.columns if any(upper[c] > pp_cfg.correlation_threshold)]
+    # Paper-described algorithm (iterative mean-abs-correlation removal).
+    corr_cols = iterative_corr_filter(X_train, pp_cfg.correlation_threshold)
     X_train = X_train.drop(columns=corr_cols)
     X_test = X_test.drop(columns=corr_cols)
-    log.append({'step': 'correlation', 'n_dropped': len(corr_cols),
+    log.append({'step': 'correlation_iterative', 'n_dropped': len(corr_cols),
                 'columns': ','.join(corr_cols)})
 
     scaler = StandardScaler().fit(X_train)
@@ -166,20 +185,24 @@ def metric_row(name, y_true, pred, prob=None, extra=None):
 
 
 def base_rate_analysis(rows, prevalences=(0.5, 0.1, 0.01, 1e-3, 1e-4)):
-    """Precision at assumed spoofing prevalence pi, from TPR and FPR.
+    """Precision at assumed prevalence pi, WITH Clopper-Pearson intervals.
 
-    precision(pi) = TPR*pi / (TPR*pi + FPR*(1 - pi)). Answers 'what fraction
-    of alarms are real if spoofing is rare', without retraining anything.
+    The point estimate alone is meaningless when fp == 0: with ~4.3k test
+    negatives the FPR resolution floor (~7e-4) sits above pi = 1e-4, so the
+    interval columns are the honest quantity to report.
     """
     out = []
     for r in rows:
-        tpr = r['tp'] / (r['tp'] + r['fn']) if (r['tp'] + r['fn']) else np.nan
-        fpr = r['fp'] / (r['fp'] + r['tn']) if (r['fp'] + r['tn']) else np.nan
         for pi in prevalences:
-            denom = tpr * pi + fpr * (1 - pi)
+            iv = precision_at_prevalence_interval(
+                r['tp'], r['fn'], r['fp'], r['tn'], pi)
             out.append({'classifier': r['classifier'], 'prevalence': pi,
-                        'tpr': tpr, 'fpr': fpr,
-                        'precision_at_prevalence': (tpr * pi / denom) if denom else np.nan})
+                        'tpr': iv['tpr'], 'fpr': iv['fpr'],
+                        'tpr_ci_lo': iv['tpr_ci'][0], 'tpr_ci_hi': iv['tpr_ci'][1],
+                        'fpr_ci_lo': iv['fpr_ci'][0], 'fpr_ci_hi': iv['fpr_ci'][1],
+                        'precision_at_prevalence': iv['point'],
+                        'precision_lo': iv['lower'],
+                        'precision_hi': iv['upper']})
     return pd.DataFrame(out)
 
 
@@ -209,8 +232,14 @@ def run_split(df, train_mask, test_mask, cfg, split_name, out_dir, mana_df=None)
           f'features={X_train.shape[1]} '
           f'(spoofed test={int(y_test.sum())}/{len(y_test)})')
 
+    th_cfg = getattr(cfg, 'thresholds', None)
+    th_enabled = bool(_cfg_get(th_cfg, 'enabled', False))
+    th_val_frac = float(_cfg_get(th_cfg, 'val_fraction', 0.25))
+    th_targets = list(_cfg_get(th_cfg, 'target_fprs', [0.01, 0.05]))
+
     zoo = build_models(cfg.models.tier, cfg.models.seed, cfg.models.svm)
     rows, per_scenario_rows, preds = [], [], {}
+    th_rows = []
 
     for name, (model, needs_scaling) in zoo.items():
         Xtr = X_train_sc if needs_scaling else X_train
@@ -230,7 +259,7 @@ def run_split(df, train_mask, test_mask, cfg, split_name, out_dir, mana_df=None)
         t0 = time.time()
         pred = model.predict(Xte)
         infer_ms = (time.time() - t0) / max(len(Xte), 1) * 1000
-        prob = model.predict_proba(Xte)[:, 1]
+        prob = scores_of(model, Xte)
         preds[name] = pred
 
         rows.append(metric_row(name, y_test, pred, prob,
@@ -246,15 +275,35 @@ def run_split(df, train_mask, test_mask, cfg, split_name, out_dir, mana_df=None)
         print(f'  {name:<14} F1={rows[-1]["f1"]:.4f} P={rows[-1]["precision"]:.4f} '
               f'R={rows[-1]["recall"]:.4f} (fit {fit_s:.0f}s)')
 
-    # MANA joins the comparison only on rows where it produced a prediction.
+        # Threshold-policy evaluation (negatives-anchored operating points).
+        if th_enabled:
+            Xf, Xv, yf, yv = sk_split(Xtr, ytr, test_size=th_val_frac,
+                                      stratify=ytr,
+                                      random_state=cfg.models.seed)
+            m2 = type(model)(**model.get_params())
+            m2.fit(Xf, yf)
+            sval, ste = scores_of(m2, Xv), scores_of(m2, Xte)
+            pols = {'default_0.5': pick_threshold(sval, yv, 'default'),
+                    'val_max_f1': pick_threshold(sval, yv, 'val_max_f1')}
+            for tf in th_targets:
+                pols[f'fpr_target_{tf:g}'] = pick_threshold(
+                    sval, yv, 'fpr_target', target_fpr=tf)
+            for pol, t in pols.items():
+                p2 = (ste >= t).astype(int)
+                th_rows.append(metric_row(name, y_test, p2, ste,
+                                          {'policy': pol,
+                                           'threshold': float(t)}))
+
+    # MANA joins on rows where it produced a prediction; ML metrics are then
+    # ALSO reported on that identical subset (denominator symmetry).
     if mana_df is not None:
         merged = test_df.merge(mana_df, on='filename', how='left')
         valid = merged['mana_pred'].isin([0, 1]).values
         n_excluded = int((~valid).sum())
         if n_excluded:
             print(f'  MANA: excluding {n_excluded} test rows with missing/error predictions')
-        rows.append(metric_row('MANA', y_test[valid],
-                               merged.loc[valid, 'mana_pred'].astype(int).values,
+        mana_pred = merged.loc[valid, 'mana_pred'].astype(int).values
+        rows.append(metric_row('MANA', y_test[valid], mana_pred,
                                None, {'n_excluded': n_excluded}))
         for scen in sorted(test_df['scenario'].unique()):
             m = valid & (merged['scenario'] == scen).values
@@ -262,6 +311,13 @@ def run_split(df, train_mask, test_mask, cfg, split_name, out_dir, mana_df=None)
                 per_scenario_rows.append(metric_row(
                     'MANA', y_test[m], merged.loc[m, 'mana_pred'].astype(int).values,
                     None, {'scenario': scen}))
+        if n_excluded:
+            sub_rows = [metric_row(n, y_test[valid], p[valid])
+                        for n, p in preds.items()]
+            sub_rows.append(metric_row('MANA', y_test[valid], mana_pred))
+            pd.DataFrame(sub_rows).to_csv(
+                os.path.join(out_dir, 'overall_results_mana_subset.csv'),
+                index=False)
 
     overall = pd.DataFrame(rows)
     overall.to_csv(os.path.join(out_dir, 'overall_results.csv'), index=False)
@@ -269,6 +325,9 @@ def run_split(df, train_mask, test_mask, cfg, split_name, out_dir, mana_df=None)
         os.path.join(out_dir, 'per_scenario_results.csv'), index=False)
     base_rate_analysis(rows).to_csv(
         os.path.join(out_dir, 'base_rate_analysis.csv'), index=False)
+    if th_rows:
+        pd.DataFrame(th_rows).to_csv(
+            os.path.join(out_dir, 'threshold_results.csv'), index=False)
 
     # Per-parameter breakdown for cliff curves and heatmaps (test side only).
     pp = test_df[META_COLS].copy()
@@ -296,6 +355,20 @@ def run_split(df, train_mask, test_mask, cfg, split_name, out_dir, mana_df=None)
         pass
 
     return overall
+
+
+def library_versions():
+    import scipy
+    import sklearn
+    vers = {'python': platform.python_version(),
+            'numpy': np.__version__, 'pandas': pd.__version__,
+            'scipy': scipy.__version__, 'scikit_learn': sklearn.__version__}
+    for mod in ('xgboost', 'lightgbm', 'scapy', 'statsmodels'):
+        try:
+            vers[mod] = __import__(mod).__version__
+        except ImportError:
+            vers[mod] = None
+    return vers
 
 
 def main():
@@ -335,7 +408,9 @@ def main():
 
     manifest = {'regime': regime, 'tier': cfg.models.tier, 'seed': cfg.models.seed,
                 'features_csv': cfg.paths.features_csv,
-                'python': platform.python_version()}
+                'ablate_families': list(
+                    _cfg_get(cfg.preprocessing, 'ablate_families', []) or []),
+                'library_versions': library_versions()}
 
     if regime == 'repetition':
         tr, te = split_mod.repetition_split(df)
@@ -350,7 +425,8 @@ def main():
         allf = pd.concat(fold_frames, ignore_index=True)
         summary = allf.groupby('classifier')[['f1', 'precision', 'recall']].agg(['mean', 'std'])
         summary.to_csv(os.path.join(root, 'kfold_summary.csv'))
-        print('\nK-fold summary (mean +/- std):')
+        print('\nK-fold summary (mean +/- std). NOTE: folds share most of their')
+        print('training data; the std is descriptive only, never feed it to a t-test.')
         print(summary.round(4).to_string())
     elif regime == 'param_holdout':
         preset_name = cfg.split.param_holdout_preset

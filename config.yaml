@@ -5,8 +5,8 @@
 paths:
   # MARSIM dataset root (contains dataset.json and the pcap files)
   dataset_dir: "dataset/dataset"
-  # Per-epoch parquet series (new artifact enabling sequence models and
-  # sliding-window evaluation). One file per recording, sharded by scenario.
+  # Per-epoch parquet series (enables sequence models, sliding-window
+  # evaluation, and attack injection into real logs).
   epochs_dir: "results/epochs"
   features_csv: "data/marsim_features.csv"
   mana_predictions_csv: "data/mana_predictions.csv"
@@ -20,7 +20,7 @@ receivers:
   rx2: ["192.168.0.11", 62997]
 
 extraction:
-  save_epoch_series: true      # write per-recording parquet (needed for LSTM/Transformer work)
+  save_epoch_series: true      # write per-recording parquet (sequence models + injection)
   validate_checksums: false    # MARSIM is clean; real logs validate regardless
   n_workers: 0                 # 0 = os.cpu_count() - 2
 
@@ -28,11 +28,19 @@ features:
   profile: "full"              # "full" (138 features) or "deployable" (GGA+VTG+ZDA only)
 
 preprocessing:
+  # Artifact ablation (see scripts/audit_dataset.py): the SNR family is a
+  # simulator fingerprint (mean_snr_median is a single-feature PERFECT
+  # oracle, AUC 1.0000, on scenarios A1 and A2); GSA features are constant.
+  # The journal experiments run artifact-free by default. Set to [] only to
+  # reproduce the contaminated CIMSS-era upper bound, and disclose it.
+  ablate_families: ["snr", "gsa"]
   zero_variance_eps: 1.0e-10
   nan_col_drop_threshold: 0.5
   skew_threshold: 5.0
   winsorize: true              # set false to match the CIMSS paper text exactly
   winsorize_quantiles: [0.01, 0.99]
+  # Iterative mean-abs-correlation removal (matches the paper text; the old
+  # greedy upper-triangle rule was a different algorithm and is gone).
   correlation_threshold: 0.95
 
 split:
@@ -42,15 +50,23 @@ split:
 
 models:
   tier: "default"              # default | adjusted | both
-  # "default": library defaults + n_estimators=500 where applicable, matching
-  #            the paper's out-of-the-box claim.
-  # "adjusted": the original repo's hand-tuned settings, reported as a
-  #             second tier and disclosed as such.
   svm:
     enabled: true
     train_on_full_set: true    # false reproduces the old 10k subsample (must be disclosed)
     subsample_size: 10000
+    # probability=true adds a hidden 5-fold Platt refit (hours on the full
+    # set). Leave false; AUC and thresholds use decision_function instead.
+    probability: false
   seed: 42
+
+# Decision-threshold policies (see mspoof.thresholds). The negatives-anchored
+# fpr_target policy recovers the extrapolation-regime recall collapse
+# (RF 0.867 -> 0.971 at realized FPR ~1%) using NO test labels; the textbook
+# val_max_f1 policy makes it WORSE and is kept only as a baseline.
+thresholds:
+  enabled: true
+  val_fraction: 0.25
+  target_fprs: [0.01, 0.05]
 
 real_data:
   window_s: 120
